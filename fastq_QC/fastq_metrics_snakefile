@@ -1,0 +1,87 @@
+''' A pipeline to run some metrics on your raw fastqs, fastqc, multiqc, and fastqscreen to get an idea of adapater or bacterial contam in your libraries'''
+
+import os
+import pandas as pd
+import sys
+sys.path.insert(0, '../scripts')
+from library_quality_plots import *
+from fastq_collate_metrics import *
+
+
+configfile: 'fastq_config.yaml'
+
+CELLID = config['cell_ids']
+
+#Some of t
+def paired_read_list_creator(cell_id_list):
+    '''creates a list of cell_ids with paired end identifiers to use in pipeline'''
+    paired_end_list = []
+    for cell in cell_id_list:
+        paired_end_list.append(str(cell + '_1_trimmed'))
+        paired_end_list.append(str(cell + '_2_trimmed'))
+    return paired_end_list
+
+paired_end_list = paired_read_list_creator(CELLID)
+
+PAIRED_END = paired_end_list
+
+
+rule all:
+    input: 
+        os.path.join(config['output_dir'], 'multiqc_output', "multiqc.html"),
+        os.path.join(config['output_dir'], str(config['library_id'] + '_collated_fastq_screen.csv'))
+ 
+
+rule fastqc:
+    'run fastqc on all fastq files - runs paired end seperately'
+    input:
+        os.path.join(config["input_dir"], "{paired_end}.fastq.gz")
+    output:
+        html= os.path.join(config['output_dir'], 'fastqc_output', "{paired_end}.html"),
+        zip= os.path.join(config['output_dir'], 'fastqc_output', "{paired_end}_fastqc.zip") 
+    log:
+        "logs/fastqc/{paired_end}.log"
+    threads: 1
+    wrapper:
+        "v1.23.4/bio/fastqc"
+
+
+rule multiqc:
+    'create multiqc file from all fastqc files generated in previous step'
+    input:
+        expand(os.path.join(config['output_dir'], 'fastqc_output', "{paired_end}_fastqc.zip"), paired_end = PAIRED_END)
+    output:
+        os.path.join(config['output_dir'], 'multiqc_output', "multiqc.html")
+    log:
+        "logs/multiqc.log"
+    wrapper:
+        "v1.4.0/bio/multiqc"
+
+
+rule fastq_screen:
+    #run fastq_screen on all paired end fastq files
+    input:
+        fq = os.path.join(config["input_dir"], "{paired_end}.fastq.gz"),
+        conf = config['fastq_screen_conf'],
+        outdir = os.path.join(config['output_dir'], 'fastq_screen_output')
+    output:
+        txt = os.path.join(config['output_dir'], 'fastq_screen_output', "{paired_end}_screen.txt"),
+        png = os.path.join(config['output_dir'], 'fastq_screen_output', "{paired_end}_screen.png"),
+        html = os.path.join(config['output_dir'], 'fastq_screen_output', "{paired_end}_screen.html"),
+    run:
+        if is_non_zero_file(input.fq):
+            shell('''fastq_screen --conf {input.conf} {input.fq} --aligner 'BWA' --outdir {input.outdir}''')
+        else:
+            shell('''touch {output.txt}''')
+            shell('''touch {output.png}''')
+            shell('''touch {output.html}''')
+
+
+rule collate_fastq_screen:
+    input:
+        files = expand(os.path.join(config['output_dir'], 'fastq_screen_output', "{paired_end}_screen.txt"), paired_end = PAIRED_END),
+        fastq_dir = directory(os.path.join(config['output_dir'], 'fastq_screen_output'))
+    output:
+        csv = os.path.join(config['output_dir'], str(config['library_id'] + '_collated_fastq_screen.csv'))
+    run:
+        collate_fastq_screen_paired_end(input.fastq_dir, output.csv)

@@ -1,0 +1,202 @@
+'''This pipeline collects and collates picard metrics on bam files - it compiles WGS metrics, GC bias metrics, Duplicate metrics and Insert metrics
+and collates these metrics for each cell into one file.'''
+
+' LAST UPDATED 2023-05-04'
+
+'''  To run this pipeline, call the following in n106 headnode while biof501env is activated and you're in the bam_metrics directory:
+snakemake \
+    -s /projects/steiflab/research/hmacdonald/bam_metrics/snakefile \
+    --jobs 2000 \
+    --latency-wait 30 \
+    --keep-going \
+    --cluster '
+     sbatch \
+        --cpus-per-task {threads} \
+        --time 5-0:0:0
+        --output=/projects/steiflab/research/hmacdonald/bam_metrics/bam_metrics_scratch/slurm_output'
+'''
+
+import os
+import sys
+sys.path.insert(0, '../..')
+from dictionary_functions import *
+from collate_metrics import *
+
+configfile: 'bam_config_DNA.yaml'
+
+CELLID = config['cell_ids']
+
+
+bam_input = os.path.join(config['input_dir'], "{cellid}.bam")
+
+bam_dict = create_input_bam_dict(config['cell_ids'], config['input_dir'])
+output_dict = create_output_file_dict(config['cell_ids'], config['output_dir'])
+
+
+rule all: 
+    input:
+        expand(os.path.join(config['input_dir'], "{cellid}.bam.bai"), cellid = CELLID),
+        expand(os.path.join(config['output_dir'],  "individual_cell_metrics", "{cellid}.gc_bias_metrics_chart.pdf"), cellid = CELLID),
+        os.path.join(config['output_dir'], "collated_metrics", str(config['library_id'] + '.wgs_metrics.csv')),
+        os.path.join(config['output_dir'], "collated_metrics", str(config['library_id'] + '.wgs_hist.csv')),
+        os.path.join(config['output_dir'], "collated_metrics", str(config['library_id'] + '.gc_bias_metrics.csv')),
+        os.path.join(config['output_dir'], "collated_metrics", str(config['library_id'] + '.gc_bias_summary.csv')),
+        os.path.join(config['output_dir'], "collated_metrics", str(config['library_id'] + '.duplicate_metrics.csv')),
+        os.path.join(config['output_dir'], "collated_metrics", str(config['library_id'] + '.insert_metrics.csv')),
+        os.path.join(config['output_dir'], "collated_metrics", str(config['library_id'] + '.insert_hist.csv')),
+        os.path.join(config['output_dir'], "collated_metrics", str(config['library_id'] + '.mt_coverage.csv'))
+
+
+
+#index bam files for processing 
+rule index_bam_files:
+   input:
+        bam = bam_input
+   output:
+        index_output = os.path.join(config['input_dir'], "{cellid}.bam.bai")
+   run:
+    shell('samtools index {input.bam}')
+
+#Convert a bam file to a bed file 
+rule bam_to_bed:
+    input: 
+        bam = bam_input
+    output:
+        temp(os.path.join(config['output_dir'], "{cellid}.bed"))
+    shell:'''
+        samtools view -uF 0x400 {input} | bedtools bamtobed -i > {output}'''
+
+#Calculate mitochondrial coverage depth 
+rule calculate_mt_coverage:
+    input:  
+        bam_bed = os.path.join(config['output_dir'], "{cellid}.bed"),
+        mt_window = config['mt_window_bed']
+    output: 
+        os.path.join(config['output_dir'], "individual_cell_metrics", "{cellid}.mt_coverage.bed")
+    shell:'bedtools coverage -a {input.mt_window} -b {input.bam_bed} > {output}'
+
+
+# Collect Duplicate Metrics
+rule collect_duplicate_metrics:
+    input:
+        (os.path.join(config['input_dir'], "{cellid}.bam"))
+    output:
+        os.path.join(config['output_dir'], "individual_cell_metrics", "{cellid}.duplicate_metrics.txt")
+    shell:
+        """
+        gatk CollectDuplicateMetrics \
+            -I {input} \
+            -M {output} \
+            --VALIDATION_STRINGENCY LENIENT
+        """
+
+
+# Collect WGS Metrics 
+rule collect_wgs_metrics:
+    input: 
+        reference = config['reference_genome'],
+        bam = bam_input,
+    output:
+        txt = os.path.join(config['output_dir'],  "individual_cell_metrics", "{cellid}.wgs_metrics.txt")
+    shell:
+        """
+        gatk CollectWgsMetrics \
+            -I {input.bam} \
+            -O {output.txt} \
+            -R {input.reference} \
+            --VALIDATION_STRINGENCY LENIENT \
+            --MINIMUM_BASE_QUALITY 20 \
+            --MINIMUM_MAPPING_QUALITY 20 \
+            --COVERAGE_CAP 500
+        """
+
+# Collect GC Bias Metrics 
+rule collect_gc_bias_metrics:
+    input: 
+        bam = bam_input, 
+        reference = config['reference_genome']
+    output:
+        metrics = os.path.join(config['output_dir'],  "individual_cell_metrics", "{cellid}.gc_bias_metrics.txt"),
+        chart = os.path.join(config['output_dir'],  "individual_cell_metrics", "{cellid}.gc_bias_metrics_chart.pdf"),
+        summary = os.path.join(config['output_dir'], "individual_cell_metrics", "{cellid}.gc_bias_summary.txt")
+    shell:
+        """
+        gatk CollectGcBiasMetrics \
+            -I {input.bam} \
+            -O {output.metrics} \
+            --CHART_OUTPUT {output.chart} \
+            -S {output.summary} \
+            -R {input.reference} \
+            --VALIDATION_STRINGENCY LENIENT 
+        """
+
+
+# Collect Insert Size Metrics 
+rule collect_insert_size_metrics:
+    input:
+        os.path.join(config['input_dir'], "{cellid}.bam")
+    output:
+        metrics = os.path.join(config['output_dir'],  "individual_cell_metrics", "{cellid}.insert_metrics.txt"),
+        histogram = os.path.join(config['output_dir'],  "individual_cell_metrics", "{cellid}.insert_metrics_histo.pdf")
+    run:
+        shell("""
+            gatk CollectInsertSizeMetrics \
+            -I {input} \
+            -O {output.metrics} \
+            -H {output.histogram} \
+            --VALIDATION_STRINGENCY LENIENT  
+            """)
+        shell('''touch {output.metrics}''')
+        shell('''touch {output.histogram}''')
+
+
+#collate WGS metrics 
+rule collate_wgs_metrics:
+    input:
+        expand(os.path.join(config['output_dir'],  "individual_cell_metrics", "{cellid}.wgs_metrics.txt"), cellid = CELLID),
+    output: 
+        metrics =  os.path.join(config['output_dir'], "collated_metrics", str(config['library_id'] + '.wgs_metrics.csv')),
+        hist = os.path.join(config['output_dir'], "collated_metrics", str(config['library_id'] + '.wgs_hist.csv'))
+    run:
+        collate_wgs_metrics(output_dict['output']['wgs'], output.metrics, output.hist)
+
+#collate GC bias metrics
+rule collate_gc_bias_meterics:
+    input:
+        metrics = expand(os.path.join(config['output_dir'], "individual_cell_metrics",  "{cellid}.gc_bias_metrics.txt"), cellid = CELLID),
+        summary = expand(os.path.join(config['output_dir'],  "individual_cell_metrics", "{cellid}.gc_bias_summary.txt"), cellid = CELLID)
+    output:
+        metrics =  os.path.join(config['output_dir'], "collated_metrics", str(config['library_id'] + '.gc_bias_metrics.csv')),
+        summary = os.path.join(config['output_dir'], "collated_metrics", str(config['library_id'] + '.gc_bias_summary.csv'))
+    run:
+        collate_gc_bias_metrics(output_dict['output']['gc_bias'], output_dict['output']['gc_bias_summary'], output.metrics, output.summary)
+
+
+rule collate_duplicate_metrics:
+    input:
+        expand(os.path.join(config['output_dir'],  "individual_cell_metrics", "{cellid}.duplicate_metrics.txt"), cellid = CELLID)
+    output:
+        metrics = os.path.join(config['output_dir'], "collated_metrics", str(config['library_id'] + '.duplicate_metrics.csv'))
+    run:
+        collate_duplicate_metrics(output_dict['output']['duplicate'], output.metrics)
+
+
+rule collate_insert_metrics:
+    input:
+        expand(os.path.join(config['output_dir'],  "individual_cell_metrics", "{cellid}.insert_metrics.txt"), cellid = CELLID)
+    output:
+        metrics = os.path.join(config['output_dir'], "collated_metrics", str(config['library_id'] + '.insert_metrics.csv')),
+        hist = os.path.join(config['output_dir'], "collated_metrics", str(config['library_id'] + '.insert_hist.csv')),
+    run:
+        collate_insert_metrics(output_dict['output']['insert'], output.metrics, output.hist)
+
+rule collate_mt_coverage:
+    input:
+        expand(os.path.join(config['output_dir'], "individual_cell_metrics", "{cellid}.mt_coverage.bed"), cellid = CELLID)
+    output:
+        csv = os.path.join(config['output_dir'], "collated_metrics", str(config['library_id'] + '.mt_coverage.csv'))
+    run: 
+        collate_mt_coverage(output_dict['output']['mt_coverage'], output.csv)
+
+
+
